@@ -1,0 +1,36 @@
+[package]
+name = "supervision-pc"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "supervision_pc_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.39.6"
+netstat2 = "0.11.2"
+tauri-plugin-notification = "2.4.0"
+futures-util = "0.3.34"
+chrono = "0.4.45"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+winreg = "0.55"
+battery = "0.7"
+dirs = "7.0.0"
+sha2 = "0.10"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
