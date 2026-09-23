@@ -6,6 +6,7 @@ use tauri_plugin_notification::NotificationExt;
 use serde::{Serialize, Deserialize};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
     thread,
@@ -181,6 +182,15 @@ struct ScanTarget {
 }
 
 #[derive(Clone, Serialize)]
+struct DiskPartition {
+    name: String,
+    mount_point: String,
+    total_gb: f64,
+    used_gb: f64,
+    free_gb: f64,
+}
+
+#[derive(Clone, Serialize)]
 struct FileEntry {
     path: String,
     name: String,
@@ -201,6 +211,13 @@ struct DeleteFilesResult {
     deleted: usize,
     freed_mb: f64,
     errors: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct ScanProgress {
+    phase: String,
+    current: usize,
+    total: usize,
 }
 
 fn data_file_path(app: &AppHandle) -> PathBuf {
@@ -295,6 +312,17 @@ fn classify_extension(ext: &str) -> &'static str {
     }
 }
 
+fn is_excluded_dir(path: &Path) -> bool {
+    const EXCLUDED: [&str; 6] = [
+        "windows", "program files", "program files (x86)",
+        "programdata", "$recycle.bin", "system volume information",
+    ];
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| EXCLUDED.contains(&n.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 fn walk_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
     if out.len() >= limit {
         return;
@@ -306,6 +334,9 @@ fn walk_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
             }
             let path = entry.path();
             if path.is_dir() {
+                if is_excluded_dir(&path) {
+                    continue;
+                }
                 walk_files(&path, out, limit);
             } else {
                 out.push(path);
@@ -319,6 +350,16 @@ fn hash_file(path: &Path) -> Option<String> {
     let mut file = fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn quick_hash(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path).ok()?;
+    let mut buffer = vec![0u8; 65536];
+    let read_bytes = file.read(&mut buffer).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&buffer[..read_bytes]);
     Some(format!("{:x}", hasher.finalize()))
 }
 
@@ -787,104 +828,192 @@ fn get_scan_targets() -> Vec<ScanTarget> {
 }
 
 #[tauri::command]
-fn scan_old_large_files(paths: Vec<String>, min_size_mb: f64, min_days: u64) -> Vec<FileEntry> {
-    let mut all_files = Vec::new();
-    for p in &paths {
-        walk_files(Path::new(p), &mut all_files, 30_000);
-    }
-
-    let now = std::time::SystemTime::now();
-    let min_bytes = (min_size_mb * 1024.0 * 1024.0) as u64;
-    let min_secs = min_days * 24 * 3600;
-
-    let mut results: Vec<FileEntry> = all_files
-        .into_iter()
-        .filter_map(|path| {
-            let meta = fs::metadata(&path).ok()?;
-            if meta.len() < min_bytes {
-                return None;
+fn get_disk_partitions() -> Vec<DiskPartition> {
+    let disks = Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .map(|d| {
+            let total = d.total_space() as f64 / 1_073_741_824.0;
+            let free = d.available_space() as f64 / 1_073_741_824.0;
+            DiskPartition {
+                name: d.name().to_string_lossy().to_string(),
+                mount_point: d.mount_point().to_string_lossy().to_string(),
+                total_gb: total,
+                used_gb: (total - free).max(0.0),
+                free_gb: free,
             }
-            let modified = meta.modified().ok()?;
-            let elapsed = now.duration_since(modified).ok()?;
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn scan_old_large_files(
+    app: AppHandle,
+    paths: Vec<String>,
+    min_size_mb: f64,
+    min_days: u64,
+) -> Vec<FileEntry> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut all_files = Vec::new();
+        for p in &paths {
+            walk_files(Path::new(p), &mut all_files, 30_000);
+        }
+
+        let total = all_files.len();
+        let now = std::time::SystemTime::now();
+        let min_bytes = (min_size_mb * 1024.0 * 1024.0) as u64;
+        let min_secs = min_days * 24 * 3600;
+
+        let mut results = Vec::new();
+
+        for (i, path) in all_files.into_iter().enumerate() {
+            if i % 300 == 0 {
+                let _ = app.emit("old-scan-progress", ScanProgress {
+                    phase: "Analyse en cours".into(),
+                    current: i,
+                    total,
+                });
+            }
+
+            let meta = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.len() < min_bytes {
+                continue;
+            }
+            let modified = match meta.modified() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let elapsed = match now.duration_since(modified) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
             if elapsed.as_secs() < min_secs {
-                return None;
+                continue;
             }
 
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let file_type = classify_extension(ext).to_string();
             let last_modified = chrono::DateTime::<chrono::Local>::from(modified).format("%d/%m/%Y").to_string();
 
-            Some(FileEntry {
+            results.push(FileEntry {
                 path: path.to_string_lossy().to_string(),
                 name: path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
                 size_mb: meta.len() as f64 / 1024.0 / 1024.0,
                 last_modified,
                 file_type,
-            })
-        })
-        .collect();
+            });
+        }
 
-    results.sort_by(|a, b| b.size_mb.partial_cmp(&a.size_mb).unwrap());
-    results.truncate(200);
-    results
+        results.sort_by(|a, b| b.size_mb.partial_cmp(&a.size_mb).unwrap());
+        results.truncate(200);
+
+        let _ = app.emit("old-scan-progress", ScanProgress { phase: "Terminé".into(), current: total, total });
+        results
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
-fn scan_duplicates(paths: Vec<String>) -> Vec<DuplicateGroup> {
-    let mut all_files = Vec::new();
-    for p in &paths {
-        walk_files(Path::new(p), &mut all_files, 30_000);
-    }
+async fn scan_duplicates(app: AppHandle, paths: Vec<String>) -> Vec<DuplicateGroup> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut all_files = Vec::new();
+        for p in &paths {
+            walk_files(Path::new(p), &mut all_files, 30_000);
+        }
 
-    let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-    for path in all_files {
-        if let Ok(meta) = fs::metadata(&path) {
-            if meta.len() > 0 {
-                by_size.entry(meta.len()).or_default().push(path);
+        let _ = app.emit("duplicate-scan-progress", ScanProgress {
+            phase: "Regroupement par taille".into(),
+            current: 0,
+            total: all_files.len(),
+        });
+
+        let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+        for path in all_files {
+            if let Ok(meta) = fs::metadata(&path) {
+                if meta.len() > 0 {
+                    by_size.entry(meta.len()).or_default().push(path);
+                }
             }
         }
-    }
 
-    let mut groups = Vec::new();
+        // Seuls les groupes ayant au moins 2 fichiers de même taille sont des candidats
+        let candidates: Vec<(u64, Vec<PathBuf>)> = by_size.into_iter().filter(|(_, v)| v.len() >= 2).collect();
+        let total_candidates: usize = candidates.iter().map(|(_, v)| v.len()).sum();
+        let mut processed = 0usize;
 
-    for (size, files) in by_size {
-        if files.len() < 2 {
-            continue;
-        }
-        let mut by_hash: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        for f in files {
-            if let Some(hash) = hash_file(&f) {
-                by_hash.entry(hash).or_default().push(f);
+        let mut groups = Vec::new();
+
+        for (size, files) in candidates {
+            // Étape 1 : pré-filtre rapide (64 Ko lus seulement, pas le fichier entier)
+            let mut by_quick: HashMap<String, Vec<PathBuf>> = HashMap::new();
+            for f in files {
+                processed += 1;
+                if processed % 30 == 0 {
+                    let _ = app.emit("duplicate-scan-progress", ScanProgress {
+                        phase: "Vérification rapide".into(),
+                        current: processed,
+                        total: total_candidates,
+                    });
+                }
+                if let Some(qh) = quick_hash(&f) {
+                    by_quick.entry(qh).or_default().push(f);
+                }
             }
-        }
-        for (_, group_files) in by_hash {
-            if group_files.len() < 2 {
-                continue;
-            }
-            let entries: Vec<FileEntry> = group_files
-                .iter()
-                .map(|p| {
-                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    FileEntry {
-                        path: p.to_string_lossy().to_string(),
-                        name: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-                        size_mb: size as f64 / 1024.0 / 1024.0,
-                        last_modified: String::new(),
-                        file_type: classify_extension(ext).to_string(),
+
+            // Étape 2 : hash complet uniquement sur les vrais candidats restants
+            for (_, quick_group) in by_quick {
+                if quick_group.len() < 2 {
+                    continue;
+                }
+                let mut by_hash: HashMap<String, Vec<PathBuf>> = HashMap::new();
+                for f in quick_group {
+                    if let Some(hash) = hash_file(&f) {
+                        by_hash.entry(hash).or_default().push(f);
                     }
-                })
-                .collect();
-            groups.push(DuplicateGroup {
-                size_mb: size as f64 / 1024.0 / 1024.0,
-                file_type: entries[0].file_type.clone(),
-                files: entries,
-            });
+                }
+                for (_, group_files) in by_hash {
+                    if group_files.len() < 2 {
+                        continue;
+                    }
+                    let entries: Vec<FileEntry> = group_files
+                        .iter()
+                        .map(|p| {
+                            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            FileEntry {
+                                path: p.to_string_lossy().to_string(),
+                                name: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                                size_mb: size as f64 / 1024.0 / 1024.0,
+                                last_modified: String::new(),
+                                file_type: classify_extension(ext).to_string(),
+                            }
+                        })
+                        .collect();
+                    groups.push(DuplicateGroup {
+                        size_mb: size as f64 / 1024.0 / 1024.0,
+                        file_type: entries[0].file_type.clone(),
+                        files: entries,
+                    });
+                }
+            }
         }
-    }
 
-    groups.sort_by(|a, b| b.size_mb.partial_cmp(&a.size_mb).unwrap());
-    groups.truncate(100);
-    groups
+        groups.sort_by(|a, b| b.size_mb.partial_cmp(&a.size_mb).unwrap());
+        groups.truncate(100);
+
+        let _ = app.emit("duplicate-scan-progress", ScanProgress {
+            phase: "Terminé".into(),
+            current: total_candidates,
+            total: total_candidates,
+        });
+
+        groups
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -1023,6 +1152,7 @@ pub fn run() {
             run_diagnostic,
             run_full_fix,
             get_scan_targets,
+            get_disk_partitions,
             scan_old_large_files,
             scan_duplicates,
             delete_files

@@ -150,6 +150,14 @@ export interface ScanTarget {
   path: string;
 }
 
+export interface DiskPartition {
+  name: string;
+  mount_point: string;
+  total_gb: number;
+  used_gb: number;
+  free_gb: number;
+}
+
 export interface FileEntry {
   path: string;
   name: string;
@@ -168,6 +176,12 @@ export interface DeleteFilesResult {
   deleted: number;
   freed_mb: number;
   errors: number;
+}
+
+export interface ScanProgress {
+  phase: string;
+  current: number;
+  total: number;
 }
 
 export type Theme = "dark" | "light" | "custom";
