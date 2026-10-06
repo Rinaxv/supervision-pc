@@ -17,6 +17,7 @@ use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSock
 use futures_util::StreamExt;
 use winreg::enums::*;
 use winreg::RegKey;
+use wmi::WMIConnection;
 
 #[derive(Clone, Serialize)]
 struct SystemMetrics {
@@ -218,6 +219,155 @@ struct ScanProgress {
     phase: String,
     current: usize,
     total: usize,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+struct Win32PnPSignedDriverRaw {
+    device_name: Option<String>,
+    manufacturer: Option<String>,
+    driver_version: Option<String>,
+    driver_date: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct DriverInfo {
+    device_name: String,
+    manufacturer: String,
+    version: String,
+    date: String,
+    age_years: f64,
+    is_old: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct PendingUpdate {
+    title: String,
+    size_mb: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct WindowsUpdateReport {
+    pending: Vec<PendingUpdate>,
+    total_size_gb: f64,
+    estimated_download_minutes: f64,
+    estimated_install_minutes: f64,
+    last_install_date: String,
+    days_since_last_update: i64,
+}
+
+#[derive(Deserialize, Debug)]
+struct WuRawUpdate {
+    #[serde(rename = "Title")]
+    title: Option<String>,
+    #[serde(rename = "SizeBytes")]
+    size_bytes: Option<i64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct WuRawOutput {
+    #[serde(rename = "Updates")]
+    updates: Option<serde_json::Value>,
+    #[serde(rename = "LastInstallDate")]
+    last_install_date: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct InstallRawOutput {
+    #[serde(rename = "Status")]
+    status: Option<String>,
+    #[serde(rename = "Installed")]
+    installed: Option<i32>,
+    #[serde(rename = "RebootRequired")]
+    reboot_required: Option<bool>,
+    #[serde(rename = "Message")]
+    message: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct InstallUpdatesResult {
+    success: bool,
+    installed_count: i32,
+    reboot_required: bool,
+    message: String,
+}
+
+const WU_SCRIPT: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+try {
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $searcher = $session.CreateUpdateSearcher()
+    $result = $searcher.Search('IsInstalled=0 and IsHidden=0')
+    $updates = @()
+    foreach ($u in $result.Updates) {
+        $updates += [PSCustomObject]@{ Title = $u.Title; SizeBytes = [int64]$u.MaxDownloadSize }
+    }
+} catch {
+    $updates = @()
+}
+$lastDate = $null
+try {
+    $lastDate = (Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1 -ExpandProperty InstalledOn)
+} catch {}
+$lastDateStr = if ($lastDate) { $lastDate.ToString('yyyy-MM-dd') } else { '' }
+$output = [PSCustomObject]@{ Updates = @($updates); LastInstallDate = $lastDateStr }
+$output | ConvertTo-Json -Compress -Depth 4
+"#;
+
+const WU_INSTALL_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $searcher = $session.CreateUpdateSearcher()
+    $result = $searcher.Search('IsInstalled=0 and IsHidden=0')
+    if ($result.Updates.Count -eq 0) {
+        [PSCustomObject]@{ Status = 'NoUpdates' } | ConvertTo-Json -Compress
+        exit
+    }
+    $toDownload = New-Object -ComObject Microsoft.Update.UpdateColl
+    foreach ($u in $result.Updates) {
+        if ($u.EulaAccepted -eq $false) { $u.AcceptEula() | Out-Null }
+        $toDownload.Add($u) | Out-Null
+    }
+    $downloader = $session.CreateUpdateDownloader()
+    $downloader.Updates = $toDownload
+    $downloader.Download() | Out-Null
+
+    $toInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+    foreach ($u in $toDownload) {
+        if ($u.IsDownloaded) { $toInstall.Add($u) | Out-Null }
+    }
+    $installer = $session.CreateUpdateInstaller()
+    $installer.Updates = $toInstall
+    $installResult = $installer.Install()
+
+    [PSCustomObject]@{
+        Status = 'Done'
+        Installed = $toInstall.Count
+        RebootRequired = [bool]$installResult.RebootRequired
+    } | ConvertTo-Json -Compress
+} catch {
+    [PSCustomObject]@{ Status = 'Error'; Message = $_.Exception.Message } | ConvertTo-Json -Compress
+}
+"#;
+
+const WU_PROCESS_NAMES: [&str; 6] = [
+    "wuauclt.exe", "usoclient.exe", "mousocoreworker.exe",
+    "tiworker.exe", "wuaueng.exe", "trustedinstaller.exe",
+];
+
+fn normalize_updates(v: Option<serde_json::Value>) -> Vec<WuRawUpdate> {
+    match v {
+        None => vec![],
+        Some(serde_json::Value::Array(arr)) => arr
+            .into_iter()
+            .filter_map(|x| serde_json::from_value(x).ok())
+            .collect(),
+        Some(obj @ serde_json::Value::Object(_)) => {
+            serde_json::from_value::<WuRawUpdate>(obj).ok().into_iter().collect()
+        }
+        _ => vec![],
+    }
 }
 
 fn data_file_path(app: &AppHandle) -> PathBuf {
@@ -940,7 +1090,6 @@ async fn scan_duplicates(app: AppHandle, paths: Vec<String>) -> Vec<DuplicateGro
             }
         }
 
-        // Seuls les groupes ayant au moins 2 fichiers de même taille sont des candidats
         let candidates: Vec<(u64, Vec<PathBuf>)> = by_size.into_iter().filter(|(_, v)| v.len() >= 2).collect();
         let total_candidates: usize = candidates.iter().map(|(_, v)| v.len()).sum();
         let mut processed = 0usize;
@@ -948,7 +1097,6 @@ async fn scan_duplicates(app: AppHandle, paths: Vec<String>) -> Vec<DuplicateGro
         let mut groups = Vec::new();
 
         for (size, files) in candidates {
-            // Étape 1 : pré-filtre rapide (64 Ko lus seulement, pas le fichier entier)
             let mut by_quick: HashMap<String, Vec<PathBuf>> = HashMap::new();
             for f in files {
                 processed += 1;
@@ -964,7 +1112,6 @@ async fn scan_duplicates(app: AppHandle, paths: Vec<String>) -> Vec<DuplicateGro
                 }
             }
 
-            // Étape 2 : hash complet uniquement sur les vrais candidats restants
             for (_, quick_group) in by_quick {
                 if quick_group.len() < 2 {
                     continue;
@@ -1044,6 +1191,258 @@ fn delete_files(paths: Vec<String>, app: AppHandle, state: tauri::State<'_, Mute
     }
 
     DeleteFilesResult { deleted, freed_mb, errors }
+}
+
+#[tauri::command]
+fn get_driver_report(threshold_years: f64) -> Result<Vec<DriverInfo>, String> {
+    let wmi_con = WMIConnection::new().map_err(|e| e.to_string())?;
+
+    let raw: Vec<Win32PnPSignedDriverRaw> = wmi_con
+        .raw_query("SELECT DeviceName, Manufacturer, DriverVersion, DriverDate FROM Win32_PnPSignedDriver")
+        .map_err(|e| e.to_string())?;
+
+    let today = chrono::Local::now().naive_local().date();
+    let mut results = Vec::new();
+
+    for d in raw {
+        let name = match d.device_name {
+            Some(n) if !n.trim().is_empty() => n,
+            _ => continue,
+        };
+        let date_str = match d.driver_date {
+            Some(s) if s.len() >= 8 => s,
+            _ => continue,
+        };
+
+        let year: i32 = date_str[0..4].parse().unwrap_or(0);
+        let month: u32 = date_str[4..6].parse().unwrap_or(1);
+        let day: u32 = date_str[6..8].parse().unwrap_or(1);
+
+        let driver_date = match chrono::NaiveDate::from_ymd_opt(year, month, day) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        let age_days = (today - driver_date).num_days();
+        let age_years = age_days as f64 / 365.25;
+
+        results.push(DriverInfo {
+            device_name: name,
+            manufacturer: d.manufacturer.unwrap_or_else(|| "Fabricant inconnu".to_string()),
+            version: d.driver_version.unwrap_or_else(|| "—".to_string()),
+            date: driver_date.format("%d/%m/%Y").to_string(),
+            age_years,
+            is_old: age_years >= threshold_years,
+        });
+    }
+
+    results.sort_by(|a, b| b.age_years.partial_cmp(&a.age_years).unwrap());
+    Ok(results)
+}
+
+#[tauri::command]
+async fn get_windows_update_report(
+    state: tauri::State<'_, Mutex<AppData>>,
+) -> Result<WindowsUpdateReport, String> {
+    let output = tauri::async_runtime::spawn_blocking(|| {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", WU_SCRIPT])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let parsed: WuRawOutput = serde_json::from_str(&text).unwrap_or_default();
+    let raw_updates = normalize_updates(parsed.updates);
+
+    let pending: Vec<PendingUpdate> = raw_updates
+        .into_iter()
+        .filter_map(|u| {
+            let title = u.title?;
+            let size_bytes = u.size_bytes.unwrap_or(0).max(0) as f64;
+            Some(PendingUpdate { title, size_mb: size_bytes / 1024.0 / 1024.0 })
+        })
+        .collect();
+
+    let total_size_gb: f64 = pending.iter().map(|p| p.size_mb).sum::<f64>() / 1024.0;
+
+    let download_mbps = {
+        let data = state.lock().unwrap();
+        data.speed_test_history
+            .last()
+            .map(|s| s.download_mbps)
+            .unwrap_or(20.0)
+            .max(1.0)
+    };
+
+    let total_mb = total_size_gb * 1024.0;
+    let estimated_download_minutes = (total_mb * 8.0) / download_mbps / 60.0;
+    let estimated_install_minutes = pending.len() as f64 * 4.0;
+
+    let last_install_date = parsed.last_install_date.unwrap_or_default();
+    let days_since_last_update = if !last_install_date.is_empty() {
+        chrono::NaiveDate::parse_from_str(&last_install_date, "%Y-%m-%d")
+            .map(|d| (chrono::Local::now().naive_local().date() - d).num_days())
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+
+    Ok(WindowsUpdateReport {
+        pending,
+        total_size_gb,
+        estimated_download_minutes,
+        estimated_install_minutes,
+        last_install_date,
+        days_since_last_update,
+    })
+}
+
+#[tauri::command]
+fn get_active_wu_processes() -> Vec<String> {
+    let mut sys = System::new_all();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    sys.processes()
+        .values()
+        .filter(|p| {
+            let n = p.name().to_string_lossy().to_lowercase();
+            WU_PROCESS_NAMES.contains(&n.as_str())
+        })
+        .map(|p| p.name().to_string_lossy().to_string())
+        .collect::<HashSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+#[tauri::command]
+async fn install_windows_updates(
+    app: AppHandle,
+    state: tauri::State<'_, Mutex<AppData>>,
+) -> Result<InstallUpdatesResult, String> {
+    let output = tauri::async_runtime::spawn_blocking(|| {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", WU_INSTALL_SCRIPT])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let parsed: InstallRawOutput = serde_json::from_str(&text)
+        .map_err(|_| "Réponse de Windows Update illisible.".to_string())?;
+
+    let status = parsed.status.unwrap_or_default();
+
+    let result = match status.as_str() {
+        "NoUpdates" => InstallUpdatesResult {
+            success: true,
+            installed_count: 0,
+            reboot_required: false,
+            message: "Aucune mise à jour en attente — le système est déjà à jour.".into(),
+        },
+        "Done" => InstallUpdatesResult {
+            success: true,
+            installed_count: parsed.installed.unwrap_or(0),
+            reboot_required: parsed.reboot_required.unwrap_or(false),
+            message: "Installation terminée.".into(),
+        },
+        _ => InstallUpdatesResult {
+            success: false,
+            installed_count: 0,
+            reboot_required: false,
+            message: parsed
+                .message
+                .unwrap_or_else(|| "Échec de l'installation — droits administrateur requis.".into()),
+        },
+    };
+
+    if result.success && result.installed_count > 0 {
+        let mut data = state.lock().unwrap();
+        log_action(
+            &app,
+            &mut data,
+            "Mise à jour Windows",
+            &format!(
+                "{} mise(s) à jour installée(s){}.",
+                result.installed_count,
+                if result.reboot_required { " (redémarrage requis)" } else { "" }
+            ),
+        );
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+fn pause_windows_updates(hours: u32) -> Result<String, String> {
+    use std::process::Command;
+
+    let disable = Command::new("sc")
+        .args(["config", "wuauserv", "start=disabled"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !disable.status.success() {
+        return Err("Action refusée — relance l'application en tant qu'administrateur.".to_string());
+    }
+    let _ = Command::new("sc").args(["stop", "wuauserv"]).output();
+
+    let script = format!(
+        r#"
+$resumeTime = (Get-Date).AddHours({hours})
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -Command "sc.exe config wuauserv start=demand; sc.exe start wuauserv"'
+$trigger = New-ScheduledTaskTrigger -Once -At $resumeTime
+Unregister-ScheduledTask -TaskName 'SupervisionPC_ResumeWU' -Confirm:$false -ErrorAction SilentlyContinue
+Register-ScheduledTask -TaskName 'SupervisionPC_ResumeWU' -Action $action -Trigger $trigger -Force | Out-Null
+"#,
+        hours = hours
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output();
+
+    Ok(format!(
+        "Mises à jour Windows mises en pause pour {} h — réactivation automatique programmée.",
+        hours
+    ))
+}
+
+#[tauri::command]
+fn resume_windows_updates() -> Result<String, String> {
+    use std::process::Command;
+
+    let enable = Command::new("sc")
+        .args(["config", "wuauserv", "start=demand"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !enable.status.success() {
+        return Err("Action refusée — relance l'application en tant qu'administrateur.".to_string());
+    }
+    let _ = Command::new("sc").args(["start", "wuauserv"]).output();
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Unregister-ScheduledTask -TaskName 'SupervisionPC_ResumeWU' -Confirm:$false -ErrorAction SilentlyContinue",
+        ])
+        .output();
+
+    Ok("Mises à jour Windows réactivées.".to_string())
+}
+
+#[tauri::command]
+fn get_wu_service_status() -> String {
+    use std::process::Command;
+    if let Ok(o) = Command::new("sc").args(["qc", "wuauserv"]).output() {
+        let text = String::from_utf8_lossy(&o.stdout).to_uppercase();
+        if text.contains("DISABLED") {
+            return "paused".to_string();
+        }
+    }
+    "active".to_string()
 }
 
 #[tauri::command]
@@ -1155,7 +1554,14 @@ pub fn run() {
             get_disk_partitions,
             scan_old_large_files,
             scan_duplicates,
-            delete_files
+            delete_files,
+            get_driver_report,
+            get_windows_update_report,
+            get_active_wu_processes,
+            install_windows_updates,
+            pause_windows_updates,
+            resume_windows_updates,
+            get_wu_service_status
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -1314,10 +1720,19 @@ pub fn run() {
                     let is_peak = download_kbps > (avg * 2.5) && download_kbps > 500.0;
 
                     if is_peak && should_notify(&mut last_notif, "network") {
-                        let _ = bg_handle.notification().builder()
-                            .title("Pic de trafic réseau détecté")
-                            .body("Une activité réseau inhabituelle a été observée.")
-                            .show();
+                        let wu_processes = get_active_wu_processes();
+                        if !wu_processes.is_empty() {
+                            let _ = bg_handle.notification().builder()
+                                .title("Mise à jour Windows en arrière-plan")
+                                .body("Windows Update télécharge actuellement des mises à jour, ce qui explique le pic de trafic réseau.")
+                                .show();
+                            let _ = bg_handle.emit("wu-background-activity", wu_processes);
+                        } else {
+                            let _ = bg_handle.notification().builder()
+                                .title("Pic de trafic réseau détecté")
+                                .body("Une activité réseau inhabituelle a été observée.")
+                                .show();
+                        }
                     }
 
                     if download_history.len() == 10 {

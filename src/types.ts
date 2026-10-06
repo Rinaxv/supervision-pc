@@ -184,6 +184,29 @@ export interface ScanProgress {
   total: number;
 }
 
+export interface DriverInfo {
+  device_name: string;
+  manufacturer: string;
+  version: string;
+  date: string;
+  age_years: number;
+  is_old: boolean;
+}
+
+export interface PendingUpdate {
+  title: string;
+  size_mb: number;
+}
+
+export interface WindowsUpdateReport {
+  pending: PendingUpdate[];
+  total_size_gb: number;
+  estimated_download_minutes: number;
+  estimated_install_minutes: number;
+  last_install_date: string;
+  days_since_last_update: number;
+}
+
 export type Theme = "dark" | "light" | "custom";
 export type Page =
   | "dashboard"
@@ -199,4 +222,12 @@ export type Page =
   | "historique"
   | "disk-io"
   | "diagnostic"
-  | "disk-cleaner";
+  | "disk-cleaner"
+  | "drivers"
+  | "windows-update";
+export interface InstallUpdatesResult {
+  success: boolean;
+  installed_count: number;
+  reboot_required: boolean;
+  message: string;
+}

@@ -16,6 +16,8 @@ import Historique from "./pages/Historique";
 import DiskIO from "./pages/DiskIO";
 import Diagnostic from "./pages/Diagnostic";
 import DiskCleaner from "./pages/DiskCleaner";
+import Drivers from "./pages/Drivers";
+import WindowsUpdate from "./pages/WindowsUpdate";
 import { AlertTriangle, X } from "lucide-react";
 import type {
   SystemMetrics,
@@ -125,7 +127,6 @@ function App() {
           </div>
         )}
 
-        {page === "diagnostic" && <Diagnostic />}
         {page === "dashboard" && (
           <Dashboard metrics={metrics} network={network} history={history} />
         )}
@@ -141,6 +142,9 @@ function App() {
         {page === "maintenance" && <Maintenance />}
         {page === "battery" && <Battery />}
         {page === "historique" && <Historique />}
+        {page === "diagnostic" && <Diagnostic />}
+        {page === "drivers" && <Drivers />}
+        {page === "windows-update" && <WindowsUpdate />}
       </main>
     </div>
   );

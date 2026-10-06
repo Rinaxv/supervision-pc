@@ -17,6 +17,8 @@ import {
   HardDrive,
   Stethoscope,
   FolderSearch,
+  CircuitBoard,
+  DownloadCloud,
 } from "lucide-react";
 import type { Page, Theme } from "../types";
 
@@ -90,6 +92,16 @@ export default function Sidebar({
       icon: <LayoutDashboard size={19} />,
     },
     { id: "quick-actions", label: "Actions rapides", icon: <Zap size={19} /> },
+    {
+      id: "windows-update",
+      label: "Mises à jour Windows",
+      icon: <DownloadCloud size={19} />,
+    },
+    {
+      id: "drivers",
+      label: "Pilotes obsolètes",
+      icon: <CircuitBoard size={19} />,
+    },
     {
       id: "disk-cleaner",
       label: "Analyse du disque",

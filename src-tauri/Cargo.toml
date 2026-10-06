@@ -27,6 +27,7 @@ winreg = "0.55"
 battery = "0.7"
 dirs = "7.0.0"
 sha2 = "0.10"
+wmi = "0.18.4"
 
 [profile.release]
 codegen-units = 1
